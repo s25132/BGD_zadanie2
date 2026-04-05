@@ -83,14 +83,12 @@ def build_silver_spark(engine, jdbc_url, db_properties, load_mode="incremental")
             .withColumn("country", F.upper(F.trim(F.col("country").cast("string"))))
             .withColumn("payment_method", F.lower(F.trim(F.col("payment_method").cast("string"))))
             .withColumn("status", F.lower(F.trim(F.col("status").cast("string"))))
-            .withColumn("transaction_ts", F.to_timestamp("transaction_ts"))
+            .withColumn("transaction_ts", F.try_to_timestamp(F.col("transaction_ts")))
             .withColumn(
                 "amount",
-                F.regexp_replace(
-                    F.trim(F.col("amount").cast("string")),
-                    ",",
-                    "."
-                ).cast("double")
+                F.expr(
+                "try_cast(replace(trim(cast(amount as string)), ',', '.') as double)"
+                )
             )
         )
 
@@ -211,6 +209,7 @@ def build_silver_spark(engine, jdbc_url, db_properties, load_mode="incremental")
                     validation_error,
                     updated_at
                 FROM {stage_table}
+                WHERE is_valid = TRUE
                 ON CONFLICT (transaction_id) DO UPDATE
                 SET
                     batch_no = EXCLUDED.batch_no,
