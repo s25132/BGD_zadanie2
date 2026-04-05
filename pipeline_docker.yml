@@ -1,0 +1,47 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: medallion_pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: medallion
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./pipeline/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+
+  pipeline:
+    build:
+      context: ./pipeline
+      dockerfile: Dockerfile
+    container_name: pipeline
+    environment:
+      - DATA_FILE=/app/data/transactions_03_24_1.csv
+      - DB_URL=postgresql+psycopg2://postgres:postgres@postgres:5432/medallion
+      - CHUNK_SIZE=100000
+
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - postgres
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: medallion_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+volumes:
+  postgres_data:
+  pgadmin_data:
