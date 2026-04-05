@@ -1,5 +1,44 @@
 version: "3.9"
 
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: my-airflow:medallion
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "True"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: "supersekretny_jwt_123456789"
+    AIRFLOW__API__SECRET_KEY: "supersekretny_api_123456789"
+
+    DB_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/medallion
+    JDBC_URL: jdbc:postgresql://postgres:5432/medallion
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: postgres
+    CHUNK_SIZE: "100000"
+    DATA_FILE: /opt/airflow/data/transactions_03_24_1.csv
+    LOAD_MODE: incremental
+    SPARK_MASTER: spark://spark-master:7077
+
+    PYTHONPATH: "/opt/airflow:/opt/airflow/src"
+
+  volumes: &airflow-common-volumes
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./src:/opt/airflow/src
+    - ./data:/opt/airflow/data
+
+x-airflow-depends-on: &airflow-depends-on
+  postgres:
+    condition: service_healthy
+  airflow-init:
+    condition: service_completed_successfully
+
 services:
   postgres:
     image: postgres:16
@@ -10,24 +49,58 @@ services:
       POSTGRES_DB: medallion
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     volumes:
-      - ./pipeline/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./postgres/init:/docker-entrypoint-initdb.d
       - postgres_data:/var/lib/postgresql/data
 
-  pipeline:
-    build:
-      context: ./pipeline
-      dockerfile: Dockerfile
-    container_name: pipeline
-    environment:
-      - DATA_FILE=/app/data/transactions_03_24_1.csv
-      - DB_URL=postgresql+psycopg2://postgres:postgres@postgres:5432/medallion
-      - CHUNK_SIZE=100000
 
-    volumes:
-      - ./data:/app/data
+  spark-master:
+    image: apache/spark:latest
+    container_name: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    ports:
+      - "7077:7077"
+      - "8081:8081"
+
+  spark-worker:
+    image: apache/spark:latest
+    container_name: spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
     depends_on:
-      - postgres
+      - spark-master
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: airflow db migrate
+
+  airflow-api-server:
+    <<: *airflow-common
+    container_name: airflow-api-server
+    ports:
+      - "8080:8080"
+    depends_on: *airflow-depends-on
+    command: airflow api-server
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    depends_on: *airflow-depends-on
+    command: airflow scheduler
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    depends_on: *airflow-depends-on
+    command: airflow dag-processor
 
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -38,7 +111,8 @@ services:
     ports:
       - "5050:80"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     volumes:
       - pgadmin_data:/var/lib/pgadmin
 

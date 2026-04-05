@@ -17,7 +17,7 @@ def get_silver_batches(engine) -> set[int]:
     return {int(row[0]) for row in rows}
 
 
-def build_silver_spark(engine, jdbc_url: str, db_properties: dict):
+def build_silver_spark(engine, jdbc_url, db_properties, load_mode="incremental"):
     """
     Builds SILVER incrementally using Spark.
     Processes only new RAW batches using JDBC pushdown query.
@@ -26,7 +26,13 @@ def build_silver_spark(engine, jdbc_url: str, db_properties: dict):
     raw_batches = get_raw_batches(engine)
     silver_batches = get_silver_batches(engine)
 
-    batches_to_process = sorted(raw_batches - silver_batches)
+    if load_mode == "incremental":
+        batches_to_process = raw_batches - silver_batches
+    else:
+        print("FULL mode → processing ALL batches")
+        batches_to_process = raw_batches
+
+    batches_to_process = sorted(batches_to_process)
 
     if not batches_to_process:
         print("No new batches to process in SILVER (Spark)")

@@ -29,8 +29,10 @@ Problemy z danymi:
 
 ## Pipeline 
 
-Pipeline ma cztery moduły
-###  RAW Ingestion – raw.py
+Pipeline medallion_pipeline jest zaimplemenotwany jako DAG w Airflow.
+
+Pipeline ma trzy taski
+###  RAW Ingestion – raw_ingestion()
 
 Cel: przechowywanie surowych, historycznych danych (append-only)
 
@@ -48,15 +50,16 @@ Cechy:
 - pełna historia danych
 - możliwość audytu i ponownego przetwarzania
 
-### Cleaned and validated data – silver.py
+### Cleaned and validated data – silver_build(should_continue: bool)
 
 Cel: oczyszczone i zwalidowane dane
 
-- Pobiera dane z warstwy RAW
+- Odczytuje dane z warstwy RAW przy użyciu Apache Spark i JDBC
 - Przetwarza tylko nowe batch’e (na podstawie silver.batch_log)
 - Czyści i normalizuje dane (tekst, daty, liczby)
 - Wykonuje walidację danych (np. brak transaction_id, błędna data, błędna kwota, ujemna kwota)
 - Dodaje kolumny: is_valid oraz validation_error
+- Wykorzystuje Spark DataFrame API do skalowalnego przetwarzania danych
 - Zapisuje dane do: silver.transactions_clean
 - Używa mechanizmu UPSERT (ON CONFLICT DO UPDATE) na kluczu transaction_id
 - Rejestruje przetworzony batch w tabeli: silver.batch_log
@@ -66,8 +69,9 @@ Cechy:
 - przetwarzanie inkrementalne (tylko nowe batch’e)
 - idempotentność (wielokrotne uruchomienie daje ten sam wynik)
 - brak duplikatów na poziomie transaction_id
+- skalowalne transformacje z użyciem Spark
 
-### Analytical Modeling – gold.py 
+### Analytical Modeling – gold_build(should_continue: bool)
 
 Cel: dane gotowe do analizy i raportowania (schemat gwiazdy)
 
@@ -96,26 +100,40 @@ Cechy:
 - możliwość aktualizacji danych (np. zmiana nazwy klienta)
 - model typu star schema
 
-### Pipeline control - pipeline.py
 
-- steruje uruchamianiem wszystkich etapów przetwarzania danych (RAW, SILVER, GOLD).
+## Parametr load_mode
+
+Parametr load_mode określa sposób przetwarzania danych w pipeline i pozwala przełączać się pomiędzy trybem przyrostowym (incremental) oraz pełnym (full).
+
+Jest on przekazywany w docker-compose lub podczas uruchamiania DAG-a w Apache Airflow
+
+### Tryb incremental (domyślny)
+
+Tryb przyrostowy przetwarza wyłącznie nowe dane, które nie były wcześniej załadowane.
+
+W tym trybie:
+- sprawdzane jest, czy plik został już wcześniej przetworzony (na podstawie file_hash i ingestion_log)
+- jeśli plik już istnieje → pipeline pomija warstwę RAW
+- w warstwie SILVER przetwarzane są tylko nowe batch’e danych
+- w warstwie GOLD dane są aktualizowane przy użyciu operacji UPSERT
+
+## Tryb full
+
+Tryb pełny umożliwia ponowne przetworzenie wszystkich danych historycznych.
+
+W tym trybie:
+- dane są ładowane do RAW niezależnie od wcześniejszych zapisów (ignorowany jest ingestion_log)
+- warstwa SILVER przetwarza wszystkie batch’e danych dostępne w RAW
+- warstwa GOLD ponownie buduje model analityczny na podstawie pełnego zbioru danych
 
 ## Uruchomienie
-
-Uruchomienie skrytpu pipeline 
 
 docker compose -f pipeline_docker.yml build 
 
 docker compose -f pipeline_docker.yml up 
 
-Podgląd danych 
-
-docker compose -f show_data.yml build 
-
-docker compose -f show_data.yml up
-
 ## Sql tworzący bazę danych
-BGD_zadanie1/pipeline/db/init.sql
+postgres/init/02-init-medallion.sql
 
 ## Przydatne sql
 SELECT count(1) FROM "raw".transactions_raw
@@ -133,5 +151,16 @@ SELECT
 FROM pg_catalog.pg_statio_user_tables
 ORDER BY size_gb DESC
 
+## Możliwa konfiguracja z GUI airflow (file i load_mode)
+
+Trigger DAG:
+{
+  "file": "/opt/airflow/data/transactions_03_24_1.csv",
+  "load_mode": "incremental"
+}
+
 ## Architektura
-![GRAPH](BGD_zadanie11.png)
+![GRAPH](BGD_zadanie2.png)
+
+## Działający pipeline w airflow
+![GRAPH](airflow.png)
