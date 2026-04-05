@@ -117,7 +117,7 @@ W tym trybie:
 - w warstwie SILVER przetwarzane są tylko nowe batch’e danych
 - w warstwie GOLD dane są aktualizowane przy użyciu operacji UPSERT
 
-## Tryb full
+### Tryb full
 
 Tryb pełny umożliwia ponowne przetworzenie wszystkich danych historycznych.
 
