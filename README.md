@@ -1,4 +1,4 @@
-# BGD_zadanie1
+# BGD_zadanie2
 
 ## Cel zadania 
 Celem projektu jest zaprojektowanie i implementacja skalowalnego pipeline’u przetwarzania danych transakcyjnych, który przekształca surowe, potencjalnie błędne dane w wysokiej jakości model analityczny (warstwa GOLD), umożliwiający wiarygodne raportowanie i analizę biznesową.
