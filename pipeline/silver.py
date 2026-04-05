@@ -1,7 +1,8 @@
-import uuid
-import pandas as pd
+from pyspark.sql import functions as F
 from sqlalchemy import text
+
 from raw import get_raw_batches
+from spark_utils import get_spark
 
 
 def get_silver_batches(engine) -> set[int]:
@@ -16,146 +17,157 @@ def get_silver_batches(engine) -> set[int]:
     return {int(row[0]) for row in rows}
 
 
-def build_silver(engine):
+def build_silver_spark(engine, jdbc_url: str, db_properties: dict):
     """
-    Builds SILVER only for RAW batches that were not processed yet.
-    Target table is updated with UPSERT on transaction_id.
+    Builds SILVER incrementally using Spark.
+    Processes only new RAW batches using JDBC pushdown query.
     """
+
     raw_batches = get_raw_batches(engine)
     silver_batches = get_silver_batches(engine)
 
     batches_to_process = sorted(raw_batches - silver_batches)
 
     if not batches_to_process:
-        print("No new batches to process in SILVER")
+        print("No new batches to process in SILVER (Spark)")
         return
 
+    spark = get_spark("silver-layer")
+
     for batch_no in batches_to_process:
-        print(f"Building SILVER for batch {batch_no}...")
+        print(f"Processing batch {batch_no} with Spark...")
 
-        with engine.connect() as conn:
-            chunk = pd.read_sql(
-                text("""
-                    SELECT
-                        batch_no,
-                        source_file,
-                        file_hash,
-                        transaction_id,
-                        customer_id,
-                        customer_name,
-                        merchant_id,
-                        transaction_ts,
-                        amount,
-                        city,
-                        country,
-                        payment_method,
-                        status
-                    FROM raw.transactions_raw
-                    WHERE batch_no = :batch_no
-                """),
-                conn,
-                params={"batch_no": int(batch_no)}
-            )
+        batch_query = f"""
+        (
+            SELECT
+                batch_no,
+                source_file,
+                file_hash,
+                transaction_id,
+                customer_id,
+                customer_name,
+                merchant_id,
+                transaction_ts,
+                amount,
+                city,
+                country,
+                payment_method,
+                status
+            FROM raw.transactions_raw
+            WHERE batch_no = {batch_no}
+        ) AS raw_batch
+        """
 
-        silver = chunk.copy()
-
-        silver["transaction_id"] = silver["transaction_id"].astype(str).str.strip()
-        silver["customer_id"] = silver["customer_id"].astype(str).str.strip()
-        silver["customer_name"] = silver["customer_name"].astype(str).str.strip().str.title()
-        silver["merchant_id"] = silver["merchant_id"].astype(str).str.strip()
-        silver["city"] = silver["city"].astype(str).str.strip().str.title()
-        silver["country"] = silver["country"].astype(str).str.strip().str.upper()
-        silver["payment_method"] = silver["payment_method"].astype(str).str.strip().str.lower()
-        silver["status"] = silver["status"].astype(str).str.strip().str.lower()
-
-        silver["transaction_ts"] = pd.to_datetime(
-            silver["transaction_ts"],
-            errors="coerce"
+        batch_df = spark.read.jdbc(
+            url=jdbc_url,
+            table=batch_query,
+            properties=db_properties
         )
 
-        silver["amount"] = pd.to_numeric(
-            silver["amount"].astype(str).str.replace(",", ".", regex=False).str.strip(),
-            errors="coerce"
-        )
-
-        silver["validation_error"] = ""
-
-        silver.loc[
-            silver["transaction_id"].isin(["", "nan", "none", "NaN", "None"]),
-            "validation_error"
-        ] += "missing transaction_id; "
-
-        silver.loc[
-            silver["transaction_ts"].isna(),
-            "validation_error"
-        ] += "bad date; "
-
-        silver.loc[
-            silver["amount"].isna(),
-            "validation_error"
-        ] += "bad amount; "
-
-        silver.loc[
-            silver["amount"] < 0,
-            "validation_error"
-        ] += "negative amount; "
-
-        silver["is_valid"] = silver["validation_error"] == ""
-
-        silver = silver[
-            [
-                "transaction_id",
-                "batch_no",
-                "source_file",
-                "file_hash",
-                "customer_id",
-                "customer_name",
-                "merchant_id",
-                "transaction_ts",
+        # ----------------------------
+        # CLEANING & NORMALIZATION
+        # ----------------------------
+        df = (
+            batch_df
+            .withColumn("transaction_id", F.trim(F.col("transaction_id").cast("string")))
+            .withColumn("customer_id", F.trim(F.col("customer_id").cast("string")))
+            .withColumn("customer_name", F.initcap(F.trim(F.col("customer_name").cast("string"))))
+            .withColumn("merchant_id", F.trim(F.col("merchant_id").cast("string")))
+            .withColumn("city", F.initcap(F.trim(F.col("city").cast("string"))))
+            .withColumn("country", F.upper(F.trim(F.col("country").cast("string"))))
+            .withColumn("payment_method", F.lower(F.trim(F.col("payment_method").cast("string"))))
+            .withColumn("status", F.lower(F.trim(F.col("status").cast("string"))))
+            .withColumn("transaction_ts", F.to_timestamp("transaction_ts"))
+            .withColumn(
                 "amount",
-                "city",
-                "country",
-                "payment_method",
-                "status",
-                "is_valid",
-                "validation_error"
-            ]
-        ]
-
-        stage_table = f"transactions_clean_stage_{uuid.uuid4().hex[:8]}"
-
-        with engine.begin() as conn:
-            conn.execute(text(f"""
-                CREATE TABLE silver.{stage_table} (
-                    transaction_id TEXT,
-                    batch_no INT,
-                    source_file TEXT,
-                    file_hash TEXT,
-                    customer_id TEXT,
-                    customer_name TEXT,
-                    merchant_id TEXT,
-                    transaction_ts TIMESTAMP,
-                    amount NUMERIC,
-                    city TEXT,
-                    country TEXT,
-                    payment_method TEXT,
-                    status TEXT,
-                    is_valid BOOLEAN,
-                    validation_error TEXT
-                )
-            """))
-
-        silver.to_sql(
-            stage_table,
-            engine,
-            schema="silver",
-            if_exists="append",
-            index=False,
-            method="multi",
-            chunksize=5000
+                F.regexp_replace(
+                    F.trim(F.col("amount").cast("string")),
+                    ",",
+                    "."
+                ).cast("double")
+            )
         )
 
+        # ----------------------------
+        # VALIDATION
+        # ----------------------------
+        df = (
+            df
+            .withColumn(
+                "validation_error",
+                F.concat(
+                    F.when(
+                        F.col("transaction_id").isNull() |
+                        (F.col("transaction_id") == "") |
+                        (F.lower(F.col("transaction_id")).isin("nan", "none")),
+                        F.lit("missing transaction_id; ")
+                    ).otherwise(F.lit("")),
+
+                    F.when(
+                        F.col("transaction_ts").isNull(),
+                        F.lit("bad date; ")
+                    ).otherwise(F.lit("")),
+
+                    F.when(
+                        F.col("amount").isNull(),
+                        F.lit("bad amount; ")
+                    ).otherwise(F.lit("")),
+
+                    F.when(
+                        F.col("amount") < 0,
+                        F.lit("negative amount; ")
+                    ).otherwise(F.lit(""))
+                )
+            )
+            .withColumn("is_valid", F.col("validation_error") == "")
+            .withColumn("updated_at", F.current_timestamp())
+        )
+
+        # ----------------------------
+        # SELECT FINAL COLUMNS
+        # ----------------------------
+        df = df.select(
+            "transaction_id",
+            "batch_no",
+            "source_file",
+            "file_hash",
+            "customer_id",
+            "customer_name",
+            "merchant_id",
+            "transaction_ts",
+            "amount",
+            "city",
+            "country",
+            "payment_method",
+            "status",
+            "is_valid",
+            "validation_error",
+            "updated_at"
+        )
+
+        # ----------------------------
+        # WRITE TO STAGING TABLE
+        # ----------------------------
+        stage_table = f"silver.transactions_clean_stage_{batch_no}"
+
+        print(f"Writing staging table: {stage_table}")
+
+        (
+            df.write
+            .mode("overwrite")
+            .jdbc(
+                url=jdbc_url,
+                table=stage_table,
+                properties=db_properties
+            )
+        )
+
+        # ----------------------------
+        # UPSERT INTO TARGET TABLE
+        # ----------------------------
         with engine.begin() as conn:
+            print("Upserting into silver.transactions_clean...")
+
             conn.execute(text(f"""
                 INSERT INTO silver.transactions_clean (
                     transaction_id,
@@ -191,8 +203,8 @@ def build_silver(engine):
                     status,
                     is_valid,
                     validation_error,
-                    CURRENT_TIMESTAMP
-                FROM silver.{stage_table}
+                    updated_at
+                FROM {stage_table}
                 ON CONFLICT (transaction_id) DO UPDATE
                 SET
                     batch_no = EXCLUDED.batch_no,
@@ -212,6 +224,7 @@ def build_silver(engine):
                     updated_at = CURRENT_TIMESTAMP
             """))
 
+            # log batch
             conn.execute(
                 text("""
                     INSERT INTO silver.batch_log (batch_no)
@@ -221,6 +234,10 @@ def build_silver(engine):
                 {"batch_no": int(batch_no)}
             )
 
-            conn.execute(text(f"DROP TABLE silver.{stage_table}"))
+            # cleanup staging
+            conn.execute(text(f"DROP TABLE IF EXISTS {stage_table}"))
 
-    print("SILVER complete")
+        print(f"Batch {batch_no} processed successfully")
+
+    spark.stop()
+    print("SILVER Spark complete")
